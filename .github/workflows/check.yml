@@ -14,12 +14,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # BRI OMC
-          - model: "SM-A525F"
-            region: "EUX"
-          # ODM OMC
-          - model: "SM-A525F"
-            region: "INS"
+          - model: "a52q"
+          - model: "m52xq"
+          - model: "a52sxq"
+          - model: "a71"
 
     steps:
       - name: Checkout repo
@@ -27,54 +25,39 @@ jobs:
         with:
           submodules: true
 
-      - name: Compare latest version with current version
-        run: |
-          need_update=0
-          latest=`curl --retry 5 --retry-delay 5 http://fota-cloud-dn.ospserver.net/firmware/${{ matrix.region }}/${{ matrix.model }}/version.xml | grep latest | sed 's/^[^>]*>//' | sed 's/<.*//'`
-          latest_short=`echo $latest | cut -d'/' -f1`
-          latest_csc=`echo $latest | cut -d'/' -f2`
-          latest_modem=`echo $latest | cut -d'/' -f3`
-          current=`cat current.${{ matrix.model }}_${{ matrix.region }}` || need_update=1
-          [[ $latest != $current ]] && need_update=1
-          echo "latest_version=$latest" >> $GITHUB_ENV
-          echo "latest_shortversion=$latest_short" >> $GITHUB_ENV
-          echo "latest_cscversion=$latest_csc" >> $GITHUB_ENV
-          echo "latest_modemversion=$latest_modem" >> $GITHUB_ENV
-          echo "need_update=$need_update" >> $GITHUB_ENV
+      - name: Clone NcX OTA repo
+        uses: actions/checkout@v2
+        with:
+          repository: ShaDisNX255/NcX_OnUpdate
+          path: NcX
+          ref: main
 
       - name: Install dependencies
         if: env.need_update == 1
         run: |
           sudo apt-get update
-          sudo apt-get install -y liblz4-tool zip simg2img f2fs-tools
-          sudo wget -O /usr/bin/samfirm https://github.com/jesec/SamFirm.NET/releases/latest/download/linux-x64 && sudo chmod +x /usr/bin/samfirm
-          sudo wget -O /usr/bin/lpunpack https://corsica.nu/lpunpack && sudo chmod +x /usr/bin/lpunpack
+          sudo apt-get install -y 7zip wget coreutils grep sed
+
+      - name: Compare latest version with current version
+        run: |
+          need_update=0
+          latest=`cat NcX/${{ matrix.model }}/manifest.xml  | grep VersionName | sed 's/  <VersionName>//' | sed 's/ Update<\/VersionName>//'`
+          current=`cat current.${{ matrix.model }}` || need_update=1
+          [[ $latest != $current ]] && need_update=1
+          echo "latest_version=$latest" >> $GITHUB_ENV
+          echo "need_update=$need_update" >> $GITHUB_ENV
 
       - name: Fetch firmware
         if: env.need_update == 1
-        run: samfirm -m ${{ matrix.model }} -r ${{ matrix.region }}
-
-      - name: Get path of files
-        if: env.need_update == 1
         run: |
-          echo "ap_tar=`find -name AP*`" >> $GITHUB_ENV
-          echo "bl_tar=`find -name BL*`" >> $GITHUB_ENV
-          echo "cp_tar=`find -name CP*`" >> $GITHUB_ENV
-          echo "csc_tar=`find -name CSC*`" >> $GITHUB_ENV
-          echo "home_csc_tar=`find -name HOME_CSC*`" >> $GITHUB_ENV
-
-      - name: Check downloaded firmware version
-        if: env.need_update == 1
-        run: |
-          version_short=`echo ${{ env.ap_tar }} | cut -d'_' -f3`
-          version_csc=`echo ${{ env.csc_tar }} | cut -d'_' -f4`
-          version_modem=`echo ${{ env.cp_tar }} | cut -d'_' -f3`
-          [[ $version_short == ${{ env.latest_shortversion }} ]]
-          [[ $version_csc == ${{ env.latest_cscversion }} ]]
-          [[ $version_modem == ${{ env.latest_modemversion }} ]]
-          echo PDA version: $version_short > versions.txt
-          echo CSC version: $version_csc >> versions.txt
-          echo Modem version: $version_modem >> versions.txt
+          cat NcX/${{ matrix.model }}/manifest.xml  | grep DownloadURL | sed 's/  <DownloadURL>//' | sed 's/<\/DownloadURL>//' > link.txt
+          dl=`cat link.txt`
+          wget --wait=600 -T 15 -c $dl
+          file_name='*.zip'
+          echo $file_name > filename.txt
+          file=`cat filename.txt | sed 's/OTA-//' | sed 's/.zip//'`
+          zip $file_name --out $file -s 1000m
+          rm $file_name
 
       - name: Cleanup space
         if: env.need_update == 1
@@ -84,56 +67,16 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /usr/local
 
-      - name: Extract kernel images
-        if: env.need_update == 1
-        env:
-          FILES: boot.img.lz4 dtbo.img.lz4 vbmeta.img.lz4
-        run: |
-          for file in $FILES; do tar xvf ${{ env.ap_tar }} ${file}; done
-          tar cvf ${{ env.latest_shortversion }}_kernel.tar *.lz4
-          rm *.lz4
-
-      - name: Extract PIT file
-        if: env.need_update == 1
-        run: |
-          tar --wildcards --exclude='*/*' -xvf ${{ env.csc_tar }} '*.pit'
-          echo "pit_file=`find -name *.pit`" >> $GITHUB_ENV
-
-      - name: Generate patched vbmeta
-        if: env.need_update == 1
-        run: |
-          tar xvf ${{ env.ap_tar }} vbmeta.img.lz4
-          lz4 -d vbmeta.img.lz4 vbmeta.img
-          rm vbmeta.img.lz4
-          printf "$(printf '\\x%02X' 3)" | dd of="vbmeta.img" bs=1 seek=123 count=1 conv=notrunc &> /dev/null
-          tar cvf ${{ env.latest_shortversion }}_patched_vbmeta.tar vbmeta.img
-          rm vbmeta.img
-
-      - name: Extract vendor partition
-        if: env.need_update == 1
-        run: |
-          tar xvf ${{ env.ap_tar }} super.img.lz4
-          lz4 -d super.img.lz4 super.img
-          rm super.img.lz4
-          simg2img super.img super_raw.img
-          rm super.img
-          mv super_raw.img super.img
-          lpunpack --partition=vendor super.img
-          rm super.img
-          [[ -e vendor.img.ext4 ]] && mv vendor.img.ext4 vendor.img
-          [[ -e vendor.img ]] && zip ${{ env.latest_shortversion }}_vendor.zip vendor.img
-          [[ -e vendor.img ]] && rm vendor.img
-
       - name: Update current version
         if: env.need_update == 1
         run: |
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git pull origin ${{github.ref}} --ff-only
-          echo ${{ env.latest_version }} > current.${{ matrix.model }}_${{ matrix.region }}
-          git add current.${{ matrix.model }}_${{ matrix.region }}
+          echo ${{ env.latest_version }} > current.${{ matrix.model }}
+          git add current.${{ matrix.model }}
           git commit -m "${{ matrix.model }}: ${{ env.latest_version }}"
-          git tag "${{ env.latest_shortversion }}_${{ matrix.region }}"
+          git tag "${{ env.latest_version }}"
 
       - name: Push changes to repo
         if: env.need_update == 1
@@ -149,13 +92,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.TOKEN }}
         with:
           body_path: versions.txt
-          tag_name: "${{ env.latest_shortversion }}_${{ matrix.region }}"
-          name: "${{ env.latest_shortversion }} - ${{ matrix.model }} - ${{ matrix.region }}"
+          tag_name: "${{ env.latest_version }}"
+          name: "${{ env.latest_version }} - ${{ matrix.model }}"
           files: |
-            ${{ env.bl_tar }}
-            ${{ env.cp_tar }}
-            ${{ env.home_csc_tar }}
-            ${{ env.latest_shortversion }}_kernel.tar
-            ${{ env.pit_file }}
-            ${{ env.latest_shortversion }}_patched_vbmeta.tar
-            ${{ env.latest_shortversion }}_vendor.zip
+            ${{ env.latest_version }}-${{ matrix.model }}.zip
+            ${{ env.latest_version }}-${{ matrix.model }}.z1
+            ${{ env.latest_version }}-${{ matrix.model }}.z2
+            ${{ env.latest_version }}-${{ matrix.model }}.z3
